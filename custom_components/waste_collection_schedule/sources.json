@@ -14232,6 +14232,12 @@
       "id": "rotorua_lakes_council_nz"
     },
     {
+      "title": "Selwyn District Council",
+      "module": "selwyn_govt_nz",
+      "default_params": {},
+      "id": "selwyn_govt_nz"
+    },
+    {
       "title": "Tauranga City Council",
       "module": "tauranga_govt_nz",
       "default_params": {},
