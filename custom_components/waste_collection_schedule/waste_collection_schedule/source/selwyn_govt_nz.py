@@ -32,11 +32,11 @@ TITLE = "Selwyn District Council"
 DESCRIPTION = "Source for Selwyn District Council kerbside collection schedules."
 URL = "https://www.selwyn.govt.nz"
 TEST_CASES = {
-    # Tuesday Lincoln, recycling sched=1 (Cycle B), organic sched=1 (always Cycle A)
+    # Tuesday Lincoln, recycling sched=1 (Cycle B), organic sched=1 (Cycle A)
     "15 Meijer Drive Lincoln": {"address": "15 Meijer Drive Lincoln"},
-    # Tuesday Lincoln, ALL bins sched=2 (recycling Cycle A, organic Cycle A)
+    # Tuesday Lincoln, recycling sched=2 (Cycle A), organic sched=2 (Cycle B)
     "13 Guinevere Drive Lincoln": {"address": "13 Guinevere Drive Lincoln"},
-    # Friday Rolleston, recycling sched=1 (Cycle B), organic sched=1 (always Cycle A)
+    # Friday Rolleston, recycling sched=1 (Cycle B), organic sched=1 (Cycle A)
     "5B Moore Street Rolleston": {"address": "5B Moore Street Rolleston"},
     # Thursday Darfield, schedule 1 (kept for day-of-week coverage)
     "9 Adams Road Darfield": {"address": "9 Adams Road Darfield"},
@@ -73,13 +73,10 @@ PARAM_TRANSLATIONS = {
 API_URL = "https://gis.selwyn.govt.nz/arcgis/rest/services/SDC_Public/Refuse_address/MapServer/0/query"
 
 # Selwyn DC schedule field semantics (verified empirically against the
-# council website 2026-05-02; see project Research note):
+# council website; see project Research note):
 #   - rubbish/refuse uniform charge: weekly; schedule ignored
-#   - organic: always on Cycle A; per-row COLLECTION_SCHEDULE ignored
-#   - recycling: COLLECTION_SCHEDULE is INVERTED relative to cycle parity
-#       sched="2" -> Cycle A; sched="1" -> Cycle B
-# This contradicts the field name; verified across 6 addresses spanning
-# Lincoln, Prebbleton, Rolleston, Templeton on Tuesday and Friday routes.
+#   - organic: sched="1" -> Cycle A; sched="2" -> Cycle B
+#   - recycling: INVERTED — sched="2" -> Cycle A; sched="1" -> Cycle B
 ANCHOR_CYCLE_A = datetime.date(2026, 5, 5)  # Tuesday, Cycle A
 
 PROJECTION_DAYS = 365
@@ -149,10 +146,10 @@ def _adjusted_first_collection(
     schedule, it is shifted forward by one week. Weekly bins always
     collect on the candidate date. For fortnightly bins:
 
-    - **Organic** always collects on Cycle A weeks (the per-row ``schedule``
-      value is ignored).
-    - **Recycling** has *inverted* schedule semantics: ``schedule == "2"``
-      means Cycle A, ``schedule == "1"`` means Cycle B.
+    - **Organic** has non-inverted semantics: ``schedule == "1"`` means
+      Cycle A, ``schedule == "2"`` means Cycle B.
+    - **Recycling** has *inverted* semantics: ``schedule == "2"`` means
+      Cycle A, ``schedule == "1"`` means Cycle B.
     - Future fortnightly bin types fall through unshifted.
     """
     if frequency != "Fortnightly":
@@ -162,12 +159,14 @@ def _adjusted_first_collection(
     one_week_forward = candidate + datetime.timedelta(days=7)
 
     if label == "Organic":
-        organic_collects_on_cycle_a = True
+        organic_collects_on_cycle_a = (
+            schedule == "1"
+        )  # NOT inverted: sched=1 -> Cycle A
         cycle_is_correct = candidate_falls_in_cycle_a == organic_collects_on_cycle_a
         return candidate if cycle_is_correct else one_week_forward
 
     if label == "Recycling":
-        recycling_collects_on_cycle_a = schedule == "2"
+        recycling_collects_on_cycle_a = schedule == "2"  # INVERTED: sched=2 -> Cycle A
         cycle_is_correct = candidate_falls_in_cycle_a == recycling_collects_on_cycle_a
         return candidate if cycle_is_correct else one_week_forward
 
