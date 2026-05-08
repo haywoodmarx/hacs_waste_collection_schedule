@@ -72,9 +72,8 @@ PARAM_TRANSLATIONS = {
 
 API_URL = "https://gis.selwyn.govt.nz/arcgis/rest/services/SDC_Public/Refuse_address/MapServer/0/query"
 
-# Selwyn DC schedule field semantics (verified empirically against the
-# council website; see project Research note):
-#   - rubbish/refuse uniform charge: weekly; schedule ignored
+# Selwyn DC COLLECTION_SCHEDULE semantics (verified empirically; see project
+# Research note). Only fortnightly bins have a meaningful cycle:
 #   - organic: sched="1" -> Cycle A; sched="2" -> Cycle B
 #   - recycling: INVERTED — sched="2" -> Cycle A; sched="1" -> Cycle B
 ANCHOR_CYCLE_A = datetime.date(2026, 5, 5)  # Tuesday, Cycle A
@@ -100,10 +99,10 @@ class _BinSchedule:
     (for fortnightly bins) which cycle.
     """
 
-    label: str  # "Rubbish" | "Recycling" | "Organic"
-    weekday: int  # Python weekday: Monday=0 ... Sunday=6
-    frequency: str  # "Weekly" | "Fortnightly"
-    schedule: str  # COLLECTION_SCHEDULE: "1" or "2"
+    label: str
+    weekday: int
+    frequency: str
+    schedule: str
 
 
 def _canonical_bin_label(charge_type: str) -> str | None:
@@ -232,8 +231,7 @@ class Source:
 
         full_addresses = (f["attributes"]["Address_full"] for f in features)
         distinct_addresses = sorted(set(full_addresses))
-        address_is_ambiguous = len(distinct_addresses) > 1
-        if address_is_ambiguous:
+        if len(distinct_addresses) > 1:
             raise SourceArgAmbiguousWithSuggestions(
                 "address",
                 self._address,
@@ -269,7 +267,13 @@ class Source:
                 continue
 
             frequency = attributes.get("COLLECTION_FREQUENCY", "Weekly")
-            schedule = str(attributes.get("COLLECTION_SCHEDULE", "1"))
+            # schedule only matters for fortnightly cycle selection; normalise
+            # it away for weekly bins so duplicate sizes collapse correctly.
+            schedule = (
+                str(attributes.get("COLLECTION_SCHEDULE", "1"))
+                if frequency == "Fortnightly"
+                else ""
+            )
 
             bin_schedule = _BinSchedule(
                 label=label,
@@ -291,13 +295,11 @@ class Source:
         """Project each schedule forward and return collection entries.
 
         Each ``_BinSchedule`` is projected forward ``PROJECTION_DAYS`` days
-        and emitted as :class:`Collection` entries, deduplicated on
-        ``(date, label)`` pairs.
+        and emitted as :class:`Collection` entries.
         """
         today = datetime.date.today()
         end_date = today + datetime.timedelta(days=PROJECTION_DAYS)
 
-        emitted: set[tuple[datetime.date, str]] = set()
         entries: list[Collection] = []
 
         for schedule in bin_schedules:
@@ -314,20 +316,15 @@ class Source:
 
             step_days = 7 if schedule.frequency == "Weekly" else 14
             step = datetime.timedelta(days=step_days)
+            icon = ICON_MAP.get(schedule.label)
 
             collection_date = first_collection_date
             while collection_date <= end_date:
-                pair = (collection_date, schedule.label)
-                if pair in emitted:
-                    collection_date += step
-                    continue
-
-                emitted.add(pair)
                 entries.append(
                     Collection(
                         date=collection_date,
                         t=schedule.label,
-                        icon=ICON_MAP.get(schedule.label),
+                        icon=icon,
                     )
                 )
                 collection_date += step
