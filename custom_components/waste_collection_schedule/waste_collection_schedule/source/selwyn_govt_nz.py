@@ -18,13 +18,13 @@ import logging
 import re
 from dataclasses import dataclass
 
-import requests
 from waste_collection_schedule import Collection  # type: ignore[attr-defined]
 from waste_collection_schedule.exceptions import (
     SourceArgAmbiguousWithSuggestions,
     SourceArgumentException,
     SourceArgumentNotFound,
 )
+from waste_collection_schedule.service.ArcGis import ArcGisQueryError, query_feature_layer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ PARAM_TRANSLATIONS = {
     },
 }
 
-API_URL = "https://gis.selwyn.govt.nz/arcgis/rest/services/SDC_Public/Refuse_address/MapServer/0/query"
+_FEATURE_LAYER_URL = "https://gis.selwyn.govt.nz/arcgis/rest/services/SDC_Public/Refuse_address/MapServer/0"
 
 # Selwyn DC COLLECTION_SCHEDULE semantics (verified empirically; see project
 # Research note). Only fortnightly bins have a meaningful cycle:
@@ -157,17 +157,10 @@ def _adjusted_first_collection(
     candidate_falls_in_cycle_a = _falls_in_cycle_a(candidate)
     one_week_forward = candidate + datetime.timedelta(days=7)
 
-    if label == "Organic":
-        organic_collects_on_cycle_a = (
-            schedule == "1"
-        )  # NOT inverted: sched=1 -> Cycle A
-        cycle_is_correct = candidate_falls_in_cycle_a == organic_collects_on_cycle_a
-        return candidate if cycle_is_correct else one_week_forward
-
-    if label == "Recycling":
-        recycling_collects_on_cycle_a = schedule == "2"  # INVERTED: sched=2 -> Cycle A
-        cycle_is_correct = candidate_falls_in_cycle_a == recycling_collects_on_cycle_a
-        return candidate if cycle_is_correct else one_week_forward
+    if label in ("Organic", "Recycling"):
+        # Organic: sched=1 → Cycle A (not inverted). Recycling: sched=2 → Cycle A (inverted).
+        collects_on_cycle_a = (schedule == "1") if label == "Organic" else (schedule == "2")
+        return candidate if candidate_falls_in_cycle_a == collects_on_cycle_a else one_week_forward
 
     return candidate
 
@@ -192,7 +185,7 @@ class Source:
         return self._generate_collection_entries(bin_schedules)
 
     def _query_features_for_address(self) -> list[dict]:
-        """Query the ArcGIS service and return matching feature dicts.
+        """Query the ArcGIS service and return matching attribute dicts.
 
         Raises:
             SourceArgumentException: if the address contains a single quote
@@ -204,33 +197,18 @@ class Source:
         if "'" in self._address:
             raise SourceArgumentException("address", "Address may not contain quotes")
 
-        address_pattern = f"{self._address.lower()}%"
-        where_clause = f"LOWER(Address_full) LIKE '{address_pattern}'"
-
-        params = {
-            "f": "json",
-            "where": where_clause,
-            "outFields": "*",
-            "returnGeometry": "false",
-        }
-
-        _LOGGER.debug("Selwyn API request: %s params=%s", API_URL, params)
+        where_clause = f"LOWER(Address_full) LIKE '{self._address.lower()}%'"
 
         try:
-            response = requests.get(API_URL, params=params, timeout=30)
-            response.raise_for_status()
-            payload = response.json()
-        except (requests.RequestException, ValueError) as err:
-            raise Exception(f"Selwyn API request failed: {err}") from err
-
-        features = payload.get("features", [])
-        _LOGGER.debug("Selwyn API returned %d features", len(features))
-
-        if not features:
+            features = query_feature_layer(
+                _FEATURE_LAYER_URL, where=where_clause, timeout=30
+            )
+        except ArcGisQueryError:
             raise SourceArgumentNotFound("address", self._address)
 
-        full_addresses = (f["attributes"]["Address_full"] for f in features)
-        distinct_addresses = sorted(set(full_addresses))
+        _LOGGER.debug("Selwyn API returned %d features", len(features))
+
+        distinct_addresses = sorted({a["Address_full"] for a in features})
         if len(distinct_addresses) > 1:
             raise SourceArgAmbiguousWithSuggestions(
                 "address",
@@ -251,12 +229,9 @@ class Source:
         seen_schedules: set[_BinSchedule] = set()
         unique_schedules: list[_BinSchedule] = []
 
-        for feature in features:
-            attributes = feature["attributes"]
-
+        for attributes in features:
             label = _canonical_bin_label(attributes.get("ChargeType", ""))
             if label is None:
-                # Billing-only or unknown ChargeType — drop the row.
                 continue
 
             day_name = attributes.get("COLLECTION_DAY", "")
