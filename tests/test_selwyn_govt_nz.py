@@ -116,22 +116,8 @@ class TestAdjustedFirstCollection:
     def test_weekly_no_shift(self):
         assert _adjusted_first_collection(_CYCLE_A, "Rubbish", "", "Weekly") == _CYCLE_A
 
-    # Organic: sched=1 → Cycle A (not inverted); sched=2 → Cycle B.
-
-    def test_organic_sched1_cycle_a_no_shift(self):
-        assert _adjusted_first_collection(_CYCLE_A, "Organic", "1", "Fortnightly") == _CYCLE_A
-
-    def test_organic_sched1_cycle_b_shifts(self):
-        assert _adjusted_first_collection(_CYCLE_B, "Organic", "1", "Fortnightly") == _CYCLE_B + datetime.timedelta(days=7)
-
-    def test_organic_sched2_cycle_b_no_shift(self):
-        assert _adjusted_first_collection(_CYCLE_B, "Organic", "2", "Fortnightly") == _CYCLE_B
-
-    def test_organic_sched2_cycle_a_shifts(self):
-        # sched=2 organic collects on Cycle B; if candidate is Cycle A it must shift.
-        assert _adjusted_first_collection(_CYCLE_A, "Organic", "2", "Fortnightly") == _CYCLE_A + datetime.timedelta(days=7)
-
-    # Recycling: sched=2 → Cycle A (inverted from organic); sched=1 → Cycle B.
+    # Recycling: sched=2 → Cycle A; sched=1 → Cycle B. Organic is normalised
+    # to Weekly upstream of this function and so never reaches the cycle branch.
 
     def test_recycling_sched2_cycle_a_no_shift(self):
         assert _adjusted_first_collection(_CYCLE_A, "Recycling", "2", "Fortnightly") == _CYCLE_A
@@ -188,8 +174,8 @@ class TestCollectUniqueBinSchedules:
         assert len(schedules) == 1
         assert schedules[0].label == "Rubbish"
 
-    def test_fortnightly_cycles_not_deduplicated(self):
-        # sched=1 and sched=2 are genuinely different fortnightly collection weeks.
+    def test_recycling_fortnightly_cycles_not_deduplicated(self):
+        # sched=1 and sched=2 are genuinely different fortnightly recycling weeks.
         features = [
             _attrs(charge_type="Recycling", frequency="Fortnightly", schedule="1"),
             _attrs(charge_type="Recycling", frequency="Fortnightly", schedule="2"),
@@ -209,11 +195,21 @@ class TestCollectUniqueBinSchedules:
         schedules = self._src()._collect_unique_bin_schedules([_attrs(frequency="Weekly", schedule="2")])
         assert schedules[0].schedule == ""
 
-    def test_fortnightly_schedule_preserved(self):
+    def test_recycling_fortnightly_schedule_preserved(self):
+        schedules = self._src()._collect_unique_bin_schedules(
+            [_attrs(charge_type="Recycling", frequency="Fortnightly", schedule="2")]
+        )
+        assert schedules[0].schedule == "2"
+
+    def test_organic_fortnightly_overridden_to_weekly(self):
+        # The API always reports organic as Fortnightly, but the council's own
+        # lookup treats organic as collected every week.
         schedules = self._src()._collect_unique_bin_schedules(
             [_attrs(charge_type="Organic", frequency="Fortnightly", schedule="2")]
         )
-        assert schedules[0].schedule == "2"
+        assert schedules[0].label == "Organic"
+        assert schedules[0].frequency == "Weekly"
+        assert schedules[0].schedule == ""
 
 
 # ---------------------------------------------------------------------------
@@ -278,17 +274,17 @@ class TestGenerateCollectionEntries:
         dates = sorted(e.date for e in self._src()._generate_collection_entries([schedule]))
         assert {(dates[i] - dates[i - 1]).days for i in range(1, 5)} == {14}
 
-    def test_organic_sched1_first_date_is_cycle_a(self, monkeypatch):
+    def test_recycling_sched1_first_date_is_cycle_b(self, monkeypatch):
         monkeypatch.setattr(selwyn_govt_nz.datetime, "date", FixedDate)
-        schedule = _BinSchedule("Organic", weekday=1, frequency="Fortnightly", schedule="1")
-        entries = self._src()._generate_collection_entries([schedule])
-        assert min(e.date for e in entries) == datetime.date(2026, 5, 5)
-
-    def test_organic_sched2_first_date_is_cycle_b(self, monkeypatch):
-        monkeypatch.setattr(selwyn_govt_nz.datetime, "date", FixedDate)
-        schedule = _BinSchedule("Organic", weekday=1, frequency="Fortnightly", schedule="2")
+        schedule = _BinSchedule("Recycling", weekday=1, frequency="Fortnightly", schedule="1")
         entries = self._src()._generate_collection_entries([schedule])
         assert min(e.date for e in entries) == datetime.date(2026, 5, 12)
+
+    def test_recycling_sched2_first_date_is_cycle_a(self, monkeypatch):
+        monkeypatch.setattr(selwyn_govt_nz.datetime, "date", FixedDate)
+        schedule = _BinSchedule("Recycling", weekday=1, frequency="Fortnightly", schedule="2")
+        entries = self._src()._generate_collection_entries([schedule])
+        assert min(e.date for e in entries) == datetime.date(2026, 5, 5)
 
     def test_entries_land_on_correct_weekday(self, monkeypatch):
         monkeypatch.setattr(selwyn_govt_nz.datetime, "date", FixedDate)
