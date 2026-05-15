@@ -32,3 +32,7 @@ waste_collection_schedule:
 ## How to get the source arguments
 
 Visit the [Selwyn District Council collection-day lookup](https://www.selwyn.govt.nz/services/rubbish-recycling-And-organics/kerbside-collections/collection-days-and-routes), type your address into the search box, and copy the full address shown in the autocomplete suggestions.
+
+## Notes
+
+Rubbish and organic bins are collected weekly; recycling is collected fortnightly on one of two cycles depending on the address. Public-holiday collection-day shifts are not applied — refer to the [council's holiday page](https://www.selwyn.govt.nz/services/rubbish-recycling-And-organics/kerbside-collections/holiday-collection-times) around Christmas, New Year, and Easter.
