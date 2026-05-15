@@ -11,6 +11,10 @@ Known limitations:
   two incorrect dates per year (Good Friday, Christmas, New Year's Day).
 - Address ambiguity (multiple matches) is surfaced as
   SourceArgAmbiguousWithSuggestions; the user must disambiguate manually.
+- The API returns ``COLLECTION_FREQUENCY = "Fortnightly"`` for organic bins,
+  but the council's own collection-day lookup unconditionally lists organic
+  alongside rubbish on every collection day — the schedule field never gates
+  organic display. We mirror that behaviour and treat organic as weekly.
 """
 
 import datetime
@@ -18,13 +22,13 @@ import logging
 import re
 from dataclasses import dataclass
 
-import requests
 from waste_collection_schedule import Collection  # type: ignore[attr-defined]
 from waste_collection_schedule.exceptions import (
     SourceArgAmbiguousWithSuggestions,
     SourceArgumentException,
     SourceArgumentNotFound,
 )
+from waste_collection_schedule.service.ArcGis import ArcGisQueryError, query_feature_layer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,13 +36,13 @@ TITLE = "Selwyn District Council"
 DESCRIPTION = "Source for Selwyn District Council kerbside collection schedules."
 URL = "https://www.selwyn.govt.nz"
 TEST_CASES = {
-    # Tuesday Lincoln, recycling sched=1 (Cycle B), organic sched=1 (Cycle A)
+    # Tuesday Lincoln — recycling sched=1 (Cycle B), has organic
     "15 Meijer Drive Lincoln": {"address": "15 Meijer Drive Lincoln"},
-    # Tuesday Lincoln, recycling sched=2 (Cycle A), organic sched=2 (Cycle B)
-    "13 Guinevere Drive Lincoln": {"address": "13 Guinevere Drive Lincoln"},
-    # Friday Rolleston, recycling sched=1 (Cycle B), organic sched=1 (Cycle A)
+    # Tuesday Lincoln — recycling sched=1 (Cycle B); no organic bin
+    "22 Gerald Street Lincoln": {"address": "22 Gerald Street Lincoln"},
+    # Friday Rolleston — recycling sched=1, has organic
     "5B Moore Street Rolleston": {"address": "5B Moore Street Rolleston"},
-    # Thursday Darfield, schedule 1 (kept for day-of-week coverage)
+    # Thursday Darfield (kept for day-of-week coverage)
     "9 Adams Road Darfield": {"address": "9 Adams Road Darfield"},
 }
 
@@ -70,13 +74,14 @@ PARAM_TRANSLATIONS = {
     },
 }
 
-API_URL = "https://gis.selwyn.govt.nz/arcgis/rest/services/SDC_Public/Refuse_address/MapServer/0/query"
+_FEATURE_LAYER_URL = "https://gis.selwyn.govt.nz/arcgis/rest/services/SDC_Public/Refuse_address/MapServer/0"
 
-# Selwyn DC COLLECTION_SCHEDULE semantics (verified empirically; see project
-# Research note). Only fortnightly bins have a meaningful cycle:
-#   - organic: sched="1" -> Cycle A; sched="2" -> Cycle B
-#   - recycling: INVERTED — sched="2" -> Cycle A; sched="1" -> Cycle B
-ANCHOR_CYCLE_A = datetime.date(2026, 5, 5)  # Tuesday, Cycle A
+# Selwyn DC COLLECTION_SCHEDULE only meaningfully gates recycling. The
+# council's lookup uses sched=N when getCurrentWeek()=N to decide whether
+# recycling is collected on the upcoming collection day. Our anchor week
+# corresponds to council Week 2; therefore sched="2" → Cycle A,
+# sched="1" → Cycle B for recycling.
+ANCHOR_CYCLE_A = datetime.date(2026, 5, 5)  # Tuesday, council Week 2
 
 PROJECTION_DAYS = 365
 
@@ -141,35 +146,18 @@ def _adjusted_first_collection(
 ) -> datetime.date:
     """Return the first collection date, shifted to the correct cycle.
 
-    If ``candidate`` falls on the wrong cycle for the given bin and
-    schedule, it is shifted forward by one week. Weekly bins always
-    collect on the candidate date. For fortnightly bins:
-
-    - **Organic** has non-inverted semantics: ``schedule == "1"`` means
-      Cycle A, ``schedule == "2"`` means Cycle B.
-    - **Recycling** has *inverted* semantics: ``schedule == "2"`` means
-      Cycle A, ``schedule == "1"`` means Cycle B.
-    - Future fortnightly bin types fall through unshifted.
+    Only recycling has a meaningful cycle: ``schedule == "2"`` collects on
+    Cycle A, ``schedule == "1"`` on Cycle B. If ``candidate`` falls on the
+    wrong cycle, shift forward by one week. Weekly bins and unrecognised
+    fortnightly labels fall through unmodified.
     """
-    if frequency != "Fortnightly":
+    if frequency != "Fortnightly" or label != "Recycling":
         return candidate
 
-    candidate_falls_in_cycle_a = _falls_in_cycle_a(candidate)
-    one_week_forward = candidate + datetime.timedelta(days=7)
-
-    if label == "Organic":
-        organic_collects_on_cycle_a = (
-            schedule == "1"
-        )  # NOT inverted: sched=1 -> Cycle A
-        cycle_is_correct = candidate_falls_in_cycle_a == organic_collects_on_cycle_a
-        return candidate if cycle_is_correct else one_week_forward
-
-    if label == "Recycling":
-        recycling_collects_on_cycle_a = schedule == "2"  # INVERTED: sched=2 -> Cycle A
-        cycle_is_correct = candidate_falls_in_cycle_a == recycling_collects_on_cycle_a
-        return candidate if cycle_is_correct else one_week_forward
-
-    return candidate
+    collects_on_cycle_a = schedule == "2"
+    if _falls_in_cycle_a(candidate) == collects_on_cycle_a:
+        return candidate
+    return candidate + datetime.timedelta(days=7)
 
 
 class Source:
@@ -192,7 +180,7 @@ class Source:
         return self._generate_collection_entries(bin_schedules)
 
     def _query_features_for_address(self) -> list[dict]:
-        """Query the ArcGIS service and return matching feature dicts.
+        """Query the ArcGIS service and return matching attribute dicts.
 
         Raises:
             SourceArgumentException: if the address contains a single quote
@@ -204,33 +192,18 @@ class Source:
         if "'" in self._address:
             raise SourceArgumentException("address", "Address may not contain quotes")
 
-        address_pattern = f"{self._address.lower()}%"
-        where_clause = f"LOWER(Address_full) LIKE '{address_pattern}'"
-
-        params = {
-            "f": "json",
-            "where": where_clause,
-            "outFields": "*",
-            "returnGeometry": "false",
-        }
-
-        _LOGGER.debug("Selwyn API request: %s params=%s", API_URL, params)
+        where_clause = f"LOWER(Address_full) LIKE '{self._address.lower()}%'"
 
         try:
-            response = requests.get(API_URL, params=params, timeout=30)
-            response.raise_for_status()
-            payload = response.json()
-        except (requests.RequestException, ValueError) as err:
-            raise Exception(f"Selwyn API request failed: {err}") from err
-
-        features = payload.get("features", [])
-        _LOGGER.debug("Selwyn API returned %d features", len(features))
-
-        if not features:
+            features = query_feature_layer(
+                _FEATURE_LAYER_URL, where=where_clause, timeout=30
+            )
+        except ArcGisQueryError:
             raise SourceArgumentNotFound("address", self._address)
 
-        full_addresses = (f["attributes"]["Address_full"] for f in features)
-        distinct_addresses = sorted(set(full_addresses))
+        _LOGGER.debug("Selwyn API returned %d features", len(features))
+
+        distinct_addresses = sorted({a["Address_full"] for a in features})
         if len(distinct_addresses) > 1:
             raise SourceArgAmbiguousWithSuggestions(
                 "address",
@@ -251,12 +224,9 @@ class Source:
         seen_schedules: set[_BinSchedule] = set()
         unique_schedules: list[_BinSchedule] = []
 
-        for feature in features:
-            attributes = feature["attributes"]
-
+        for attributes in features:
             label = _canonical_bin_label(attributes.get("ChargeType", ""))
             if label is None:
-                # Billing-only or unknown ChargeType — drop the row.
                 continue
 
             day_name = attributes.get("COLLECTION_DAY", "")
@@ -266,7 +236,12 @@ class Source:
                 _LOGGER.warning("Unknown COLLECTION_DAY %r — skipping row", day_name)
                 continue
 
-            frequency = attributes.get("COLLECTION_FREQUENCY", "Weekly")
+            # The API reports organic as Fortnightly, but the council's own
+            # lookup treats organic as collected every week — see module docstring.
+            if label == "Organic":
+                frequency = "Weekly"
+            else:
+                frequency = attributes.get("COLLECTION_FREQUENCY", "Weekly")
             # schedule only matters for fortnightly cycle selection; normalise
             # it away for weekly bins so duplicate sizes collapse correctly.
             schedule = (
